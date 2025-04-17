@@ -5,6 +5,8 @@ from typing import Any, Literal, Optional, overload
 import baukit
 import torch
 import transformers
+from transformers import Mamba2ForCausalLM
+
 
 # from mamba_ssm.ops.triton.layernorm import rms_norm_fn
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -26,20 +28,34 @@ class ModelandTokenizer:
             str
         ] = "EleutherAI/gpt-j-6B",  # if model is provided, this will be ignored and rewritten
         torch_dtype=torch.float32,
+        is_mamba2=False
     ) -> None:
         assert (
             model is not None or model_path is not None
         ), "Either model or model_name must be provided"
+        
+        
+        self.is_mamba2 = is_mamba2
+
+
         if model is not None:
             assert tokenizer is not None, "Tokenizer must be provided with the model"
             self.name = model.config._name_or_path
         else:
             device = "cuda" if torch.cuda.is_available() else "cpu"
             if "mamba" in model_path.lower():
-                model = Mamba.from_pretrained(model_path).to(torch_dtype).to("cuda")
-                tokenizer = AutoTokenizer.from_pretrained(
-                    "EleutherAI/gpt-neox-20b",  # Mamba was trained on the Pile with this exact tokenizer
-                )
+                if self.is_mamba2:
+                    model = Mamba2ForCausalLM.from_pretrained(
+                            model_path, revision="refs/pr/9"
+                        ).to(torch_dtype).to("cuda")
+                    tokenizer = AutoTokenizer.from_pretrained(
+                            model_path, revision="refs/pr/9", from_slow=True, legacy=False
+                        )
+                else:
+                    model = Mamba.from_pretrained(model_path).to(torch_dtype).to("cuda")
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        "EleutherAI/gpt-neox-20b",  # Mamba was trained on the Pile with this exact tokenizer
+                    )
             else:
                 model = AutoModelForCausalLM.from_pretrained(
                     model_path,
@@ -298,6 +314,9 @@ def any_parameter(model: ModelandTokenizer | Model) -> torch.nn.Parameter | None
 
 
 def determine_embedding_layer_path(model: ModelandTokenizer | Model) -> str:
+    if getattr(model, "is_mamba2", False):
+        return "model.model.embed_tokens"
+        
     model = unwrap_model(model)
     if is_gpt_variant(model):
         return "transformer.wte"
@@ -313,6 +332,9 @@ def determine_embedding_layer_path(model: ModelandTokenizer | Model) -> str:
 
 
 def determine_final_layer_norm_path(model: ModelandTokenizer | Model) -> str:
+    if getattr(model, "is_mamba2", False):
+        return "model.model.norm_f"
+        
     model = unwrap_model(model)
     if is_gpt_variant(model):
         return "transformer.ln_f"
@@ -328,6 +350,9 @@ def determine_final_layer_norm_path(model: ModelandTokenizer | Model) -> str:
 
 
 def determine_lm_head_path(model: ModelandTokenizer | Model) -> str:
+    if getattr(model, "is_mamba2", False):
+        return "lm_head"
+        
     model = unwrap_model(model)
     if is_gpt_variant(model):
         return "lm_head"
@@ -343,6 +368,9 @@ def determine_lm_head_path(model: ModelandTokenizer | Model) -> str:
 
 def determine_layers(model: ModelandTokenizer | Model) -> tuple[int, ...]:
     """Return all hidden layer names for the given model."""
+    if isinstance(model, ModelandTokenizer) and getattr(model, "is_mamba2", False):
+        return tuple(range(len(model.model.base_model.layers)))
+    
     model = unwrap_model(model)
     assert isinstance(model, Model)
 
@@ -370,7 +398,11 @@ def determine_layer_name_format(
 ) -> str | None:
     """Determine the format of layer names."""
     model = unwrap_model(model)
-
+    
+    if getattr(model, "is_mamba2", False):
+        return "model.model.layers.{}"
+        
+        
     if is_gpt_variant(model):
         if isinstance(model, transformers.GPTNeoXForCausalLM):
             return "gpt_neox.layers.{}"
@@ -425,6 +457,26 @@ def determine_layer_paths(
         Mapping from layer number to layer path.
 
     """
+    # Handle ModelandTokenizer + Mamba2
+    if isinstance(model_or_mt, ModelandTokenizer) and getattr(model_or_mt, "is_mamba2", False):
+        mt = model_or_mt
+        if layers is None:
+            layers = determine_layers(mt)
+
+        layer_paths: dict[Layer, str] = {}
+        layer_name_format = determine_layer_name_format(mt)
+
+        for layer in layers:
+            if layer == "emb":
+                layer_paths[layer] = determine_embedding_layer_path(mt)
+            elif layer == "ln_f":
+                layer_paths[layer] = determine_final_layer_norm_path(mt)
+            else:
+                layer_index = layer if layer >= 0 else len(determine_layers(mt)) + layer
+                layer_paths[layer] = layer_name_format.format(layer_index)
+
+        return layer_paths if return_dict else tuple(layer_paths[la] for la in layers)
+        
     model = unwrap_model(model)
 
     if layers is None:
@@ -453,6 +505,9 @@ def determine_layer_paths(
 
 def determine_hidden_size(model: ModelandTokenizer | Model) -> int:
     """Determine hidden rep size for the model."""
+    if isinstance(model, ModelandTokenizer) and getattr(model, "is_mamba2", False):
+        return model.model.config.hidden_size
+        
     model = unwrap_model(model)
 
     if isinstance(model, Mamba):
