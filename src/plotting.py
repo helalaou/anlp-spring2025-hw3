@@ -32,6 +32,7 @@ def plot_trace_heatmap(
     modelname=None,
     scale_range=None,
     relative_recovery=False,
+    vmin = None,
 ):
     differences = result["scores"]
     low_score = result["low_score"].to(differences.device)

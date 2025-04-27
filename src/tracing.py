@@ -21,10 +21,11 @@ from src.functional import (
     make_inputs,
     predict_from_input,
 )
-from src.hooking.mamba import MambaBlock_Hook_Points, MambaBlockForwardPatcher
+from src.hooking.mamba import MambaBlock_Hook_Points, MambaBlockForwardPatcher, Mamba2BlockForwardPatcher
 from src.models import ModelandTokenizer
 
 logger = logging.getLogger(__name__)
+printed_patch_function = False
 
 
 def trace_with_patch(
@@ -65,14 +66,22 @@ def trace_with_patch(
     token/layer pair.  To trace the effect of restoring a set of states,
     any number of token indices and layers can be listed.
     """
+    PatchFunction = MambaBlockForwardPatcher
     if mamba_block_hook is not None:
         assert isinstance(
             mt.model, Mamba
-        ), "if `mamba_block_hook` is not None, the model should be a Mamba"
+        )or getattr(mt, "is_mamba2", False), "if `mamba_block_hook` is not None, the model should be a Mamba"
         assert mamba_block_hook in get_args(
             MambaBlock_Hook_Points
         ), f"Not a valid MambaBock hook `{mamba_block_hook=}`"
-
+        
+                # Select the patcher based on model type
+        if getattr(mt, "is_mamba2", False):
+            PatchFunction = Mamba2BlockForwardPatcher
+        else:
+            PatchFunction = MambaBlockForwardPatcher
+    
+        
     embed_layername = mt.embedder_name
 
     rs = numpy.random.RandomState(1)  # For reproducibility, use pseudorandom noise
@@ -93,7 +102,8 @@ def trace_with_patch(
         noise_fn = lambda x: noise * x
     else:
         noise_fn = noise
-
+    
+    
     def patch_rep(repr, layer):
         if layer == embed_layername:
             # If requested, we corrupt a range of token embeddings on batch items x[1:]
@@ -122,8 +132,8 @@ def trace_with_patch(
 
     mt.reset_forward()  # reset the model to use default forward functions
     additional_layers = [] if trace_layers is None else trace_layers
-    if isinstance(mt.model, Mamba) == False or (
-        isinstance(mt.model, Mamba) == True and mamba_block_hook is None
+    if (isinstance(mt.model, Mamba) == False and getattr(mt, "is_mamba2", False) is False ) or (
+        (isinstance(mt.model, Mamba) == True or getattr(mt, "is_mamba2", False)) and mamba_block_hook is None
     ):
         # With the patching rules defined, run the patched model in inference.
         with torch.no_grad(), baukit.TraceDict(
@@ -140,20 +150,23 @@ def trace_with_patch(
         # uncorrupted run
         patch_layers = list(patch_spec.keys()) + additional_layers
         uncorrupted_activations = {layer: {} for layer in patch_layers}
+
         for layer in patch_layers:
             block = baukit.get_module(
                 mt.model, name=layer + ".mixer"
             )  # MambaBlock naming format
             block.forward = types.MethodType(
-                MambaBlockForwardPatcher(
+                PatchFunction(
                     retainer=uncorrupted_activations[layer],
                 ),  # get everything for the uncorrupted run
                 block,
             )
+
         with torch.inference_mode():
             mt.model(
                 input_ids=inp["input_ids"][0][None]
             )  # only the first input for the uncorrputed run
+            
 
         # ------------------------------------------------------
         # Corrupted run with patching
@@ -161,30 +174,56 @@ def trace_with_patch(
 
         for layer in patch_layers:
             block = baukit.get_module(mt.model, name=layer + ".mixer")
+
+
+            # cur_patch_spec = {
+            #     t: uncorrupted_activations[layer][mamba_block_hook][0, t]
+            #     .to(dtype=block.in_proj.weight.dtype, device=block.in_proj.weight.device)
+            #     for t in patch_spec[layer]
+            # }
             cur_patch_spec = {
                 t: uncorrupted_activations[layer][mamba_block_hook][0, t]
                 for t in patch_spec[layer]
             }
+            
+
             block.forward = types.MethodType(
-                MambaBlockForwardPatcher(
+                PatchFunction(
                     patch_spec=cur_patch_spec,
                     patch_hook=mamba_block_hook,
                 ),
                 block,
             )
+        
+
         with torch.inference_mode(), baukit.TraceDict(
             mt.model,
             [embed_layername],
             edit_output=patch_rep,  # passing to patch_rep to noise the embeddings only. Restoring the states is done in the MambaBlockForwardPatcher forwards
         ):
             outputs_exp = mt.model(input_ids=inp["input_ids"])
+            
         # ------------------------------------------------------
         mt.reset_forward()  # reset the model to use default forward functions
 
     # We report softmax probabilities for the answers_t token predictions of interest.
     logits = outputs_exp.logits if hasattr(outputs_exp, "logits") else outputs_exp
+    
+    # with torch.inference_mode():
+    #         outputs_corrupt = mt.model(input_ids=inp["input_ids"][1:].contiguous())
+    #         logits_corrupt = outputs_corrupt.logits if hasattr(outputs_corrupt, "logits") else outputs_corrupt
+            
+    #         print("Logits patched vs corrupted:", (logits_corrupt[:, -1] - logits[1:, -1]).abs().mean().item())
+            
+            
+            
     probs = torch.softmax(logits[1:, -1, :], dim=1).mean(dim=0)[answers_t]
+    
+    # print("Logits clean vs patched:", (logits[0, -1] - logits[1, -1]).abs().mean().item())
+    # print("Patched prob:", probs.item())
+    # print("Predicted token (patched):", logits[1, -1].argmax().item())
 
+    
     # If tracing all layers, collect all activations together to return.
     if trace_layers is not None:
         all_traced = torch.stack(
@@ -219,11 +258,15 @@ def calculate_hidden_flow(
     expect=None,
     mamba_block_hook: Optional[MambaBlock_Hook_Points] = None,
 ):
-    # check appropriate `kind` of module to trace based on the model
-    if isinstance(mt.model, Mamba):
-        assert kind in ["mlp", "ssm", None]
-    else:
-        assert kind in ["mlp", "attn", None]
+    
+    # print("In Calculate Hidden Flow")
+    if not getattr(mt, "is_mamba2", False):
+        
+        # check appropriate `kind` of module to trace based on the model
+        if isinstance(mt.model, Mamba):
+            assert kind in ["mlp", "ssm", None]
+        else:
+            assert kind in ["mlp", "attn", None]
 
     if alt_subject is None:
         inp = make_inputs(mt.tokenizer, [prompt] * (num_samples + 1))
@@ -238,6 +281,7 @@ def calculate_hidden_flow(
             token_range = [e_range[1] - 1]
         elif token_range is not None:
             raise ValueError(f"Unknown token_range: {token_range}")
+        
         low_score = trace_with_patch(
             mt,
             inp,
@@ -276,6 +320,9 @@ def calculate_hidden_flow(
         )
         assert subject_range[1] == alt_subj_range[1]
         e_range = (min(subject_range[0], alt_subj_range[0]), subject_range[1])
+        
+        # print("After Preparation, Now Move to Inference")
+        
 
         with torch.no_grad():
             outputs = mt(**inp)
@@ -289,7 +336,11 @@ def calculate_hidden_flow(
     if expect is not None and answer.strip() != expect:
         return dict(correct_prediction=False)
 
+        
+    # print(f"After Inference, kind is {kind} and mamba_block_hook is {mamba_block_hook}")
     if not kind and not mamba_block_hook:
+        
+        print("Move to trace_important_states")
         differences = trace_important_states(
             mt,
             inp,
@@ -303,7 +354,7 @@ def calculate_hidden_flow(
             alt_subj_patching=alt_subject is not None,
         )
     else:
-        if isinstance(mt.model, Mamba):
+        if getattr(mt, "is_mamba2", False) or isinstance(mt.model, Mamba):
             module_name_format = mt.layer_name_format
         else:
             module_name_format = (
@@ -311,6 +362,8 @@ def calculate_hidden_flow(
                 if kind == "mlp"
                 else mt.attn_module_name_format
             )
+        
+
         differences = trace_important_window(
             mt,
             module_name_format,
@@ -368,9 +421,11 @@ def trace_important_states(
 ):
     ntoks = inp["input_ids"].shape[1]
     table = []
-
+    
+    
     if token_range is None:
         token_range = range(ntoks)
+    
     for tnum in token_range:
         row = []
         for layer in range(mt.n_layer):
@@ -407,9 +462,16 @@ def trace_important_window(
 ):
     ntoks = inp["input_ids"].shape[1]
     table = []
+    
+    
+    # print(f"In trace_important_window, Looping through token range {token_range} and layers {mt.n_layer}")
+
 
     if token_range is None:
         token_range = range(ntoks)
+    
+
+    
     for tnum in token_range:
         row = []
         for layer in range(mt.n_layer):
@@ -419,6 +481,8 @@ def trace_important_window(
                     max(0, layer - window // 2), min(mt.n_layer, layer - (-window // 2))
                 )
             ]
+            
+            
             r = trace_with_patch(
                 mt,
                 inp,
@@ -432,7 +496,9 @@ def trace_important_window(
                 alt_subj_patching=alt_subj_patching,
             )
             row.append(r)
+            
         table.append(torch.stack(row))
+    
     return torch.stack(table)
 
 

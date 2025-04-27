@@ -51,6 +51,16 @@ class ModelandTokenizer:
                     tokenizer = AutoTokenizer.from_pretrained(
                             model_path, revision="refs/pr/9", from_slow=True, legacy=False
                         )
+                    
+                    # model = Mamba2ForCausalLM.from_pretrained(
+                    #     model_path, 
+                    #     torch_dtype=torch_dtype
+                    # ).to("cuda")
+                    # tokenizer = AutoTokenizer.from_pretrained(
+                    #     model_path,
+                    #     trust_remote_code=True  # required for some custom tokenizers
+                    # )
+
                 else:
                     model = Mamba.from_pretrained(model_path).to(torch_dtype).to("cuda")
                     tokenizer = AutoTokenizer.from_pretrained(
@@ -315,7 +325,7 @@ def any_parameter(model: ModelandTokenizer | Model) -> torch.nn.Parameter | None
 
 def determine_embedding_layer_path(model: ModelandTokenizer | Model) -> str:
     if getattr(model, "is_mamba2", False):
-        return "model.model.embed_tokens"
+        return "backbone.embeddings"
         
     model = unwrap_model(model)
     if is_gpt_variant(model):
@@ -333,7 +343,7 @@ def determine_embedding_layer_path(model: ModelandTokenizer | Model) -> str:
 
 def determine_final_layer_norm_path(model: ModelandTokenizer | Model) -> str:
     if getattr(model, "is_mamba2", False):
-        return "model.model.norm_f"
+        return "backbone.norm_f"
         
     model = unwrap_model(model)
     if is_gpt_variant(model):
@@ -397,11 +407,11 @@ def determine_layer_name_format(
     model: ModelandTokenizer | Model,
 ) -> str | None:
     """Determine the format of layer names."""
-    model = unwrap_model(model)
     
     if getattr(model, "is_mamba2", False):
-        return "model.model.layers.{}"
-        
+        return "backbone.layers.{}"
+    
+    model = unwrap_model(model)
         
     if is_gpt_variant(model):
         if isinstance(model, transformers.GPTNeoXForCausalLM):
@@ -458,8 +468,8 @@ def determine_layer_paths(
 
     """
     # Handle ModelandTokenizer + Mamba2
-    if isinstance(model_or_mt, ModelandTokenizer) and getattr(model_or_mt, "is_mamba2", False):
-        mt = model_or_mt
+    if isinstance(model, ModelandTokenizer) and getattr(model, "is_mamba2", False):
+        mt = model
         if layers is None:
             layers = determine_layers(mt)
 

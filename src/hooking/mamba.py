@@ -4,8 +4,11 @@ from typing import Callable, Literal, Optional, get_args
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+from torch import nn
+from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
 logger = logging.getLogger(__name__)
+
 
 
 MambaBlock_Hook_Points = Literal[
@@ -130,6 +133,295 @@ def MambaBlockForwardPatcher(
         # ------------------------------------------------------
 
         return output
+
+    return forward_patcher
+
+Mamba2Block_Hook_Points = Literal[
+    "ssm_after_ssm",
+    "after_down_proj",
+]
+
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+
+def apply_mask_to_padding_states(hidden_states, attention_mask):
+    """
+    Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
+    """
+    if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+        dtype = hidden_states.dtype
+        hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+
+    return hidden_states
+
+def Mamba2BlockForwardPatcher(
+    patch_spec: Optional[dict[int, torch.Tensor]] = None,
+    patch_hook: Optional[Mamba2Block_Hook_Points] = None,
+    retainer: Optional[dict] = None,
+) -> Callable:
+    
+    def forward_patcher(self, hidden_states, cache_params=None, cache_position=None, attention_mask=None):
+        # For now, skip CUDA fast path and assume non-cached, float32 mode
+    
+        # --- Step 1: Input Projection ---
+        # projected_states = self.in_proj(hidden_states)
+        
+        # 1. Gated MLP's linear projection
+        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+        projected_states = self.in_proj(hidden_states)
+    
+        # --- Step 2: Shape & Dim Setup ---
+        batch_size, seq_len, _ = hidden_states.shape
+        
+        groups_time_state_size = self.n_groups * self.ssm_state_size
+        d_mlp = (
+            projected_states.shape[-1]
+            - 2 * self.intermediate_size
+            - 2 * self.n_groups * self.ssm_state_size
+            - self.num_heads
+        ) // 2
+    
+    
+        A = -torch.exp(self.A_log.float())  # (num_heads) or (intermediate_size, state_size)
+        dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
+
+        # --- Step 3: Split Streams ---
+        # z0, x0, gate, hidden_states_BC, dt = projected_states.split(
+        #     [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
+        # )
+        
+        _, _, gate, hidden_states_B_C, dt = projected_states.split(
+                    [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
+                )
+
+                # 2. Convolution sequence transformation
+                # Init cache
+        if cache_params is not None:
+                    hidden_states_B_C_transposed = hidden_states_B_C.transpose(1, 2)
+                    conv_states = nn.functional.pad(
+                        hidden_states_B_C_transposed,
+                        (cache_params.conv_kernel_size - hidden_states_B_C_transposed.shape[-1], 0),
+                    )
+                    cache_params.update_conv_state(
+                        layer_idx=self.layer_idx, new_conv_state=conv_states, cache_init=True
+                    )
+    
+        # --- Step 4: Conv Block ---
+        # hidden_states_BC = self.act(self.conv1d(hidden_states_BC.transpose(1, 2)).transpose(1, 2)[..., :L])
+        
+        if self.activation not in ["silu", "swish"]:
+                    hidden_states_B_C = self.act(
+                        self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2)
+                    )
+        else:
+                    hidden_states_B_C = causal_conv1d_fn(
+                        x=hidden_states_B_C.transpose(1, 2),
+                        weight=self.conv1d.weight.squeeze(1),
+                        bias=self.conv1d.bias,
+                        activation=self.activation,
+                    ).transpose(1, 2)
+
+        hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
+    
+
+        hidden_states, B, C = torch.split(
+                    hidden_states_B_C,
+                    [self.intermediate_size, groups_time_state_size, groups_time_state_size],
+                    dim=-1,
+        )
+        
+    
+        # --- Step 5: SSM Block ---
+        scan_output, ssm_state = mamba_chunk_scan_combined(
+                    hidden_states.view(batch_size, seq_len, -1, self.head_dim),
+                    dt,
+                    A,
+                    B.view(batch_size, seq_len, self.n_groups, -1),
+                    C.view(batch_size, seq_len, self.n_groups, -1),
+                    chunk_size=self.chunk_size,
+                    D=self.D,
+                    z=None,
+                    seq_idx=None,
+                    return_final_states=True,
+                    dt_bias=self.dt_bias,
+                    dt_softplus=True,
+                    **dt_limit_kwargs,
+                )
+
+        if patch_hook == "ssm_after_ssm":
+            for idx, vec in patch_spec.items():
+                scan_output[:, idx] = vec.to(scan_output.device)
+        if retainer is not None:
+            retainer["ssm_after_ssm"] = scan_output.detach().clone()
+            
+        
+        if patch_hook == "mlp_after_silu":
+            for idx, vec in patch_spec.items():
+                gate[:, idx] = vec.to(gate.device)
+        if retainer is not None:
+            retainer["mlp_after_silu"] = gate.detach().clone()
+
+    
+        # --- Step 6: MLP Block ---
+         # Init cache
+        if ssm_state is not None and cache_params is not None:
+                    cache_params.update_ssm_state(layer_idx=self.layer_idx, new_ssm_state=ssm_state)
+
+        scan_output = scan_output.view(batch_size, seq_len, -1)
+        # Multiply "gate" branch and apply extra normalization layer
+        scan_output = self.norm(scan_output, gate)
+
+        # 4. Final linear projection
+        out = self.out_proj(scan_output)
+        
+        if patch_hook == "after_down_proj":
+            for idx, vec in patch_spec.items():
+                out[:, idx] = vec.to(out.device)
+        if retainer is not None:
+            retainer["after_down_proj"] = out.detach().clone()
+            
+        
+        return out
+
+  
+    # def forward_patcher(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None, **kwargs):
+        
+    #     seqlen_og = seqlen
+    #     if seqlen is None:
+    #         B, L, _ = u.shape
+    #     else:
+    #         B = u.shape[0] // seqlen
+    #         L = seqlen
+    
+    #     print("[DEBUG] In patcher: self class =", self.__class__)
+    #     assert False
+        
+    #     # (B, L, 18560)
+    #     if hasattr(self, "in_proj"):
+    #         zxbcdt = self.in_proj(u)
+    #     elif hasattr(self, "mixer") and hasattr(self.mixer, "in_proj"):
+    #         zxbcdt = self.mixer.in_proj(u)
+    #     else:
+    #         raise AttributeError("No in_proj found in current context.")
+
+
+    #     if seqlen_og is not None:
+    #         zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
+    
+    #     # Extract from attributes
+    #     d_ssm = self.num_heads * self.head_dim         # 128 * 64 = 8192
+    #     d_state = self.ssm_state_size                  # 128
+    #     d_mlp = (zxbcdt.shape[-1] - 2 * d_ssm - 2 * self.n_groups * d_state - self.num_heads) // 2
+    #     d_conv = self.conv1d.weight.shape[-1]          # Kernel width, usually 4
+    #     g = self.n_groups
+    #     n_heads = self.num_heads
+    #     head_dim = self.head_dim
+    
+    #     # Split into functional streams
+    #     z0, x0, z, xBC, dt = torch.split(
+    #         zxbcdt,
+    #         [d_mlp, d_mlp, d_ssm, d_ssm + 2 * g * d_state, n_heads],
+    #         dim=-1
+    #     )
+
+    
+    #     # Convolution branch
+    #     xBC = self.act(self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :-(d_conv - 1)])
+    #     x, B_, C = torch.split(xBC, [d_ssm, g * d_state, g * d_state], dim=-1)
+        
+    #     # Check if D has head dimension
+    #     if self.D.ndim == 2 and self.D.shape[0] == self.num_heads * self.head_dim:
+    #         D_reshaped = rearrange(self.D, "(h p) -> h p", p=self.head_dim)
+    #     else:
+    #         D_reshaped = self.D
+            
+    #     z_for_scan = ( None if self.rms_norm else rearrange(z, "b l (h p) -> b l h p", p=head_dim))
+    #     dt_limit = (self.time_step_min, self.time_step_max)
+
+    #     # SSM branch
+    #     y_ssm = mamba_chunk_scan_combined(
+    #         rearrange(x, "b l (h p) -> b l h p", p=head_dim),
+    #         dt,
+    #         -torch.exp(self.A_log.float()),
+    #         rearrange(B_, "b l (g n) -> b l g n", g=g),
+    #         rearrange(C, "b l (g n) -> b l g n", g=g),
+    #         chunk_size=self.chunk_size,
+    #         D=D_reshaped,
+    #         z=z_for_scan,
+    #         dt_bias=self.dt_bias,
+    #         dt_softplus=True,
+    #         seq_idx=seq_idx,
+    #         cu_seqlens=cu_seqlens,
+    #         dt_limit=dt_limit,
+    #     )
+    #     y_ssm = rearrange(y_ssm, "b l h p -> b l (h p)")
+    
+    #     if patch_hook == "ssm_after_ssm":
+    #         for idx, vec in patch_spec.items():
+    #             y_ssm[:, idx] = vec.to(y_ssm.device)
+    #     if retainer is not None:
+    #         retainer["ssm_after_ssm"] = y_ssm.detach().clone()
+    
+    #     # MLP branch
+    #     y_mlp = F.silu(z0) * x0
+    #     if patch_hook == "mlp_after_silu":
+    #         for idx, vec in patch_spec.items():
+    #             y_mlp[:, idx] = vec.to(y_mlp.device)
+    #     if retainer is not None:
+    #         retainer["mlp_after_silu"] = y_mlp.detach().clone()
+    
+    #     # Concatenate and project
+    #     y = torch.cat([y_mlp, y_ssm], dim=-1)
+    #     if seqlen_og is not None:
+    #         y = rearrange(y, "b l d -> (b l) d")
+    
+    #     out = self.out_proj(y)
+        
+    #     if patch_hook == "after_down_proj" and patch_spec is not None:
+    #         for idx, vec in patch_spec.items():
+        
+    #             # --- Sanity Check: Inject corruption first ---
+    #             # print(f"[Corrupt] Overwriting out[:, {idx}] with noise before patching")
+        
+    #             # Save corrupted version to compute delta
+    #             # before = out[:, idx].clone()
+                
+    #             # print(f"[Pre-patch] Δ(clean vs restore) = {(out[0, idx] - vec.to(out.device)).abs().mean().item():.6f}")
+    #             # print(f"[Pre-patch] Δ(corrupt vs restored) = {(out[1, idx] - vec.to(out.device)).abs().mean().item():.6f}")
+
+
+        
+    #             # Apply patch
+    #             out[:, idx] = vec.to(out.device)
+    #             # print(f"[Patch] Δ(post-patch vs clean) = {(out[0, idx] - out[1, idx]).abs().mean().item():.6f}")
+                
+    #             # print(f"[After-patch] Δ(patched vs restore) = {(out[1, idx] - vec.to(out.device)).abs().mean().item():.6f}")
+
+                
+
+    #             # Delta check
+    #             # delta = (out[:, idx] - before).abs().mean().item()
+    #             # print(f"out[:, {idx}].shape = {out[:, idx].shape}, vec.shape = {vec.shape}")
+    #             # print(f"[Patch] Δ after applying patch: {delta:.6f} (vec.mean: {vec.mean().item():.6f})")
+    #             # print(f"[vec] mean: {vec.mean().item()}, std: {vec.std().item()}, shape: {vec.shape}")
+    #             # print(f"[before] mean: {before.mean().item()}, std: {before.std().item()}")
+
+
+    #             # --- Extra debug: Check if patch is identical to clean ---
+    #             # if torch.allclose(before, vec.to(out.device), atol=1e-6):
+    #             #     print(f"[WARN] Patch vector for token {idx} is (almost) identical to pre-patch value.")
+        
+    #     if retainer is not None:
+    #         retainer["after_down_proj"] = out.detach().clone()
+        
+                
+        
+    #         # print(f"[Retainer] after_down_proj: {retainer['after_down_proj'].abs().mean().item()}")
+
+
+    
+    #     return out
+
+
 
     return forward_patcher
 
